@@ -1,94 +1,103 @@
-"use strict";
+'use strict';
 
-var gulp = require("gulp"),
-        path = require("path"),
-	gutil = require("gulp-util"),
-	through2 = require("through2"),
-	util = require("util"),
-	fs = require("fs"),	
-	toposort = require("toposort-class"),	
-	concat = require("gulp-concat");
+const fs = require('fs').promises;
+const path = require("path");
+const PluginError = require("plugin-error");
+const Toposort = require("toposort-class");
+const Transform = require('readable-stream/transform');
+const util = require("util");
 
-module.exports = function(filename, sources) {
-	if (!filename) {
-		throw new gutil.PluginError("gulp-concat-vendor", "Required parameter filename is missing");
+/**
+ * Takes a list of 'folders' container packages installed with bower, and returns the contents of mains for all
+ * packages in dependency order.
+ */
+class BowerMains extends Transform {
+	constructor() {
+		super();
+		this.toposort = new Toposort();
+		this.packageMeta = [];
 	}
 
-	var mySources = {},
-		myLibs = [],
-		myFiles = [],
-		myInfo = [];			
-
-	var bufferContents = function(file, enc, callback) {
+	/**
+	 * Index and build the dependency graph for the bower packages.
+	 *
+	 * @param {*} file
+	 * @param {*} encoding
+	 * @param {*} callback
+	 */
+	_transform(file, encoding, callback) {
 		if(file.isStream()) {
-			this.emit("error", new gutil.PluginError("gulp-concat-vendor", "Streaming not supported"));
+			this.emit("error", new PluginError("gulp-concat-vendor", "Streaming not supported"));
 			return callback();
 		}
 
-		if(!file.isNull()) {
-			myFiles.push(file.path);
+		// skips files in the stream, we only want to operate on directories.
+		// we want to iterate over the folders where we've installed modules
+		// and look for the .bower.json
+		if(!file.isDirectory()) {
+			this.files.push(file.path);
 			return callback();
 		}
 
-		var myPath = util.format("%s/.bower.json", file.path);
-		fs.exists(myPath, function(exists) {
-  			if (exists) {
-				fs.readFile(myPath, "utf8", function(error, data) {
-					if(!!error || !data) {
-						return callback();
-					}
-
-					var myData = JSON.parse(data);
-
-					if(!!myData.main && (path.extname( myData.main ) == '.js' || myData.main.constructor === Array)) {
-						var myMain = [].concat(myData.main),
-							mySourcePath = util.format("%s/%s", file.path, myMain[0]);
-
-						myInfo.push(myData);
-						mySources[myData.name] = mySourcePath;
-
-						callback();
-					}
-					else {
-						console.log(util.format("Skipping library @ %s. Bower.js is missing 'main' property or it is not a JS filetype.", file.path));
-						callback();
-					}
-				});
-  			} else {
-    			console.log(util.format("Skipping library @ %s. Couldn't find %s", file.path, myPath));
-    			callback();
-  			}
-		});
-	};
-
-	var endStream = function() {		
-		var mySort = new toposort();
-		
-		myInfo.forEach(function(data) {
-			var myDependencies = [];
-			if(!!data.dependencies) {
-				myDependencies = Object.keys(data.dependencies);
-			}		
-
-			mySort.add(data.name, myDependencies);
-		});
-
-		myLibs.push.apply(myLibs, mySort.sort().reverse().map(function(name) {
-			return mySources[name];
-		}));
-
-		myLibs = myLibs.filter(function(n){ return n != undefined });
-
-
-		myLibs = myLibs.concat(myFiles);
-
-		gulp.src(myLibs)
-			.pipe(concat(filename))
-			.on("data", function(data) {
-				this.push(data);
-				this.emit("end");
-			}.bind(this));	
+		let bowerJsonPath = path.join(file.path, '.bower.json');
+		fs.open(bowerJsonPath)
+			.catch((e) => {
+				console.log(util.format("Skipping library @ %s. Couldn't find %s. (e: %s)", file.path, bowerJsonPath, e));
+				return callback();
+			})
+			.then((handle) => fs.readFile(handle, {encoding}))
+			.catch((e) => {
+				console.log(util.format("Skipping library @ %s. Couldn't read %s. (e: %s)", file.path, bowerJsonPath, e));
+				return callback();
+			})
+			.then((data) => JSON.parse(data))
+			.catch((e) => {
+				console.log(util.format("Skipping library @ %s. Couldn't parse %s. (e: %s)", file.path, bowerJsonPath, e));
+				return callback();
+			})
+			.then((bower) => {
+				if (!bower) throw new Error("No data")
+				return bower;
+			})
+			.catch((e) => {
+				console.log(util.format("Skipping library @ %s. No data in %s. (e: %s)", file.path, bowerJsonPath, e));
+				return callback();
+			})
+			.then((bower) => {
+				if (!bower.main) throw new Error("No main")
+				return bower;
+			})
+			.catch((e) => {
+				console.log(util.format("Skipping library @ %s because .bower.json is missing 'main' property.", file.path));
+				return callback();
+			})
+			.then((bower) => {
+				// store meta data and build dependency tree.
+				this.packageMeta[bower.name] = bower;
+				let dependencies = data.dependencies && Object.keys(bower.dependencies) || [];
+				this.toposort.add(bower.name, dependencies);
+				return callback();
+			});
 	}
 
-	return through2.obj(bufferContents, endStream);
-};
+	// inject all the main files in reverse dependency order for concatenation.
+	_flush() {
+		let orderdPackages = this.toposort.sort().reverse();
+		orderdPackages.forEach((name) => {
+			let bower = this.packageMeta[name];
+			// normalize singular and arrays as an array.
+			let mains =	[].concat(bower.mains)
+			// inject each main into gulp stream.
+			mains.forEach((main) => {
+				let file = new Vinyl({ path: main });
+				this.push(file)
+			});
+		});
+	}
+}
+
+function factory(filename) {
+	return new BowerMains();
+}
+
+module.exports = factory;
